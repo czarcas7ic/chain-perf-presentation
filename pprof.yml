@@ -1,0 +1,100 @@
+name: Trigger Auto pprof
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_type:
+        description: "Profile Type (head: sync to head of chain and then profile. epoch: sync to epoch and then profile. sync: start after the last epoch and profile syncing)"
+        required: true
+        default: "head"
+        type: choice
+        options:
+          - head
+          - epoch
+          - sync
+      binary_version:
+        description: "Binary Version e.g: v24.0.1 (If empty, will use mainnet RPC version. Also can be branch name)"
+        required: false
+      profile_duration:
+        description: "Profile Duration in Seconds e.g: 3600 (Recommended 50 for Profile Type epoch)"
+        required: false
+      osmosis_sdk_fork_hash:
+        description: "Auto replace the osmosis sdk fork version used in the binary_version with the provided hash e.g: 14074954186580db1b832de48d8570f084ff9108 (If empty, will use the hash defined in the binary_version)"
+        required: false
+      osmosis_comet_fork_hash:
+        description: "Auto replace the osmosis comet fork version used in the binary_version with the provided hash e.g: 173c69df1c6d2acb8cea60d81515c21a970443fc (If empty, will use the hash defined in the binary_version)"
+        required: false
+
+jobs:
+  create-and-setup-droplet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install doctl
+        run: |
+          curl -sL https://github.com/digitalocean/doctl/releases/download/v1.74.0/doctl-1.74.0-linux-amd64.tar.gz | tar -xzv
+          sudo mv doctl /usr/local/bin
+
+      - name: Create Droplet
+        id: create-droplet
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          droplet_id=$(doctl compute droplet create github-runner-droplet --region fra1 --size m3-4vcpu-32gb --image 153426037 --ssh-keys fb:ce:1d:9a:3d:ee:5f:19:46:85:6c:ff:2c:9c:04:81 --wait --format ID --no-header)
+          echo "Droplet ID: $droplet_id"
+          echo "DROPLET_ID=$droplet_id" >> $GITHUB_ENV
+
+      - name: Get Droplet IP
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          droplet_ip=$(doctl compute droplet get ${{ env.DROPLET_ID }} --format PublicIPv4 --no-header)
+          echo "Droplet IP: $droplet_ip"
+          echo "DROPLET_IP=$droplet_ip" >> $GITHUB_ENV
+
+      - name: Wait for SSH to be ready
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/ssh_key
+          chmod 600 /tmp/ssh_key
+          echo "Waiting for SSH service to start..."
+          until ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key root@${{ env.DROPLET_IP }} "echo 'SSH is now available'"
+          do
+             echo "SSH not ready yet, retrying..."
+             sleep 10
+          done
+
+      - name: Copy and Run Script on Droplet
+        id: script
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh_key scripts/join_and_profile.sh root@${{ env.DROPLET_IP }}:/root/join_and_profile.sh
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key root@${{ env.DROPLET_IP }} \
+          "bash /root/join_and_profile.sh \
+          --profile-type ${{ github.event.inputs.profile_type }} \
+          --binary-version '${{ github.event.inputs.binary_version }}' \
+          --profile-duration '${{ github.event.inputs.profile_duration }}' \
+          --osmosis-sdk-fork-hash '${{ github.event.inputs.osmosis_sdk_fork_hash }}' \
+          --osmosis-comet-fork-hash '${{ github.event.inputs.osmosis_comet_fork_hash }}'"
+
+      - name: Return pprof download links (OPEN FOR DOWNLOAD LINKS)
+        run: |
+          echo ${{ steps.script.outputs.block_info }}
+          echo "Goroutine profile link: ${{ steps.script.outputs.goroutine_prof_link }}"
+          echo "Heap profile link: ${{ steps.script.outputs.heap_prof_link }}"
+          echo "CPU profile link: ${{ steps.script.outputs.cpu_prof_link }}"
+          echo "Trace profile link: ${{ steps.script.outputs.trace_prof_link }}"
+        #   echo "Threadcreate profile link: ${{ steps.script.outputs.threadcreate_prof_link }}"
+        #   echo "Block profile link: ${{ steps.script.outputs.block_prof_link }}"
+        #   echo "Mutex profile link: ${{ steps.script.outputs.mutex_prof_link }}"
+
+      - name: Delete Droplet
+        if: always()
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          doctl compute droplet delete ${{ env.DROPLET_ID }} --force
